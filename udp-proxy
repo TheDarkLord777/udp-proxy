@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+import socket
+import sys
+import logging
+import time
+import argparse
+import signal
+import json
+from datetime import datetime
+
+class UDPProxy:
+    def __init__(self, listen_addr='0.0.0.0', listen_port=8080,
+                 target_addr='127.0.0.1', target_port=8888,
+                 buffer_size=4096, timeout=2.0, debug=False):
+        self.listen_addr = listen_addr
+        self.listen_port = listen_port
+        self.target_addr = target_addr
+        self.target_port = target_port
+        self.buffer_size = buffer_size
+        self.timeout = timeout
+        self.debug = debug
+        self.running = True
+        self.stats = {
+            'packets_received': 0,
+            'bytes_received': 0,
+            'packets_forwarded': 0,
+            'bytes_forwarded': 0,
+            'packets_returned': 0,
+            'bytes_returned': 0,
+            'errors': 0,
+            'start_time': datetime.now().isoformat(),
+        }
+
+        # Configure logging
+        log_level = logging.DEBUG if debug else logging.INFO
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
+
+        logging.basicConfig(
+            level=log_level,
+            format=log_format,
+            handlers=[
+                logging.StreamHandler()
+            ]
+        )
+
+        # Create file handler if debug mode is enabled
+        if debug:
+            file_handler = logging.FileHandler(f"udp-proxy-{listen_port}.log")
+            file_handler.setFormatter(logging.Formatter(log_format))
+            logging.getLogger().addHandler(file_handler)
+
+        self.logger = logging.getLogger("udp-proxy")
+
+    def setup_signal_handlers(self):
+        signal.signal(signal.SIGINT, self.handle_signal)
+        signal.signal(signal.SIGTERM, self.handle_signal)
+
+    def handle_signal(self, signum, frame):
+        self.logger.info(f"Received signal {signum}, shutting down...")
+        self.running = False
+        self.print_stats()
+        sys.exit(0)
+
+    def print_stats(self):
+        self.stats['end_time'] = datetime.now().isoformat()
+        self.stats['duration_seconds'] = (datetime.fromisoformat(self.stats['end_time']) -
+                                         datetime.fromisoformat(self.stats['start_time'])).total_seconds()
+
+        self.logger.info("UDP Proxy Statistics:")
+        self.logger.info(json.dumps(self.stats, indent=2))
+
+    def start(self):
+        # Create a UDP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Allow port reuse
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Bind the socket to the port
+        server_address = (self.listen_addr, self.listen_port)
+        self.logger.info(f'Starting UDP proxy on {server_address[0]} port {server_address[1]}')
+        self.logger.info(f'Forwarding to {self.target_addr}:{self.target_port}')
+
+        try:
+            sock.bind(server_address)
+        except Exception as e:
+            self.logger.error(f"Failed to bind to {server_address}: {e}")
+            sys.exit(1)
+
+        # Set a timeout so we can check for shutdown signals
+        sock.settimeout(0.5)
+
+        self.logger.info("UDP Proxy is running. Press Ctrl+C to stop.")
+
+        while self.running:
+            try:
+                try:
+                    data, address = sock.recvfrom(self.buffer_size)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error receiving data: {e}")
+                    self.stats['errors'] += 1
+                    continue
+
+                self.stats['packets_received'] += 1
+                self.stats['bytes_received'] += len(data)
+
+                if self.debug:
+                    self.logger.debug(f'Received {len(data)} bytes from {address}')
+                    self.logger.debug(f'Data: {data.decode(errors="replace")}')
+
+                # Forward to target UDP server
+                forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                forward_socket.sendto(data, (self.target_addr, self.target_port))
+                self.stats['packets_forwarded'] += 1
+                self.stats['bytes_forwarded'] += len(data)
+
+                # Wait for response from target server
+                forward_socket.settimeout(self.timeout)
+                try:
+                    response, server = forward_socket.recvfrom(self.buffer_size)
+                    if self.debug:
+                        self.logger.debug(f'Response received from server: {len(response)} bytes')
+                        self.logger.debug(f'Response: {response.decode(errors="replace")}')
+
+                    # Send response back to original client
+                    sent = sock.sendto(response, address)
+                    self.stats['packets_returned'] += 1
+                    self.stats['bytes_returned'] += sent
+
+                    if self.debug:
+                        self.logger.debug(f'Sent {sent} bytes back to {address}')
+                except socket.timeout:
+                    self.logger.warning(f'No response from server for request from {address}')
+                except Exception as e:
+                    self.logger.error(f"Error receiving response from server: {e}")
+                    self.stats['errors'] += 1
+                finally:
+                    forward_socket.close()
+
+            except Exception as e:
+                self.logger.error(f"Error in main loop: {e}")
+                self.stats['errors'] += 1
+                time.sleep(1)  # Prevent tight loop in case of persistent errors
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='UDP Proxy Server')
+    parser.add_argument('-l', '--listen-port', type=int, default=8080,
+                        help='Port to listen on (default: 8080)')
+    parser.add_argument('-b', '--bind-address', default='0.0.0.0',
+                        help='Address to bind to (default: 0.0.0.0)')
+    parser.add_argument('-t', '--target-address', default='127.0.0.1',
+                        help='Target server address (default: 127.0.0.1)')
+    parser.add_argument('-r', '--target-port', type=int, default=8888,
+                        help='Target server port (default: 8888)')
+    parser.add_argument('-s', '--buffer-size', type=int, default=4096,
+                        help='Buffer size in bytes (default: 4096)')
+    parser.add_argument('-o', '--timeout', type=float, default=2.0,
+                        help='Timeout for target server response in seconds (default: 2.0)')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Enable debug mode with verbose logging')
+    return parser.parse_args()
+
+def main():
+    args = parse_arguments()
+
+    proxy = UDPProxy(
+        listen_addr=args.bind_address,
+        listen_port=args.listen_port,
+        target_addr=args.target_address,
+        target_port=args.target_port,
+        buffer_size=args.buffer_size,
+        timeout=args.timeout,
+        debug=args.debug
+    )
+
+    proxy.setup_signal_handlers()
+    proxy.start()
+
+if __name__ == '__main__':
+    main()
